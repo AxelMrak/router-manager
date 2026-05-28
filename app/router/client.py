@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import threading
 from typing import Any
-from urllib.parse import urlencode
 
 import requests
 
@@ -60,10 +58,6 @@ class RouterClient:
     def _rpc_call(self, method: str, params: list) -> dict:
         """Make a JSON-RPC call to /ubus.
 
-        Uses application/x-www-form-urlencoded content-type to match
-        how the W7 router admin panel sends requests. Some consumer
-        routers (Netis, MiWiFi, etc.) reject application/json.
-
         Args:
             method: The ubus method name.
             params: Parameters for the RPC call.
@@ -77,27 +71,21 @@ class RouterClient:
             RouterAuthError: Authentication failed or expired.
             RouterAPIError: Malformed or unexpected response.
         """
-        # Form-encode the JSON-RPC body — matching how the browser
-        # admin panel posts to /ubus with Content-Type:
-        #   application/x-www-form-urlencoded; charset=UTF-8
-        body = urlencode({
+        payload = {
             "jsonrpc": "2.0",
             "id": self._next_id(),
             "method": method,
-            "params": json.dumps(params),
-        })
+            "params": params,
+        }
 
-        url = self.base_url
         cookies = {}
         if self.auth_token:
-            url = f"{self.base_url}?ubus_rpc_session={self.auth_token}"
             cookies["ubus_rpc_session"] = self.auth_token
 
         try:
             response = self.session.post(
-                url,
-                data=body,
-                headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+                self.base_url,
+                json=payload,
                 cookies=cookies,
                 timeout=self.timeout,
             )
@@ -729,16 +717,14 @@ class RouterClient:
         logger.debug("Testing connection to %s", self.host)
 
         try:
-            body = urlencode({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "list",
-                "params": "[]",
-            })
             response = self.session.post(
                 self.base_url,
-                data=body,
-                headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "list",
+                    "params": [],
+                },
                 timeout=5,
             )
             return response.status_code in (200, 401, 403)
