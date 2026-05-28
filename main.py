@@ -1,6 +1,5 @@
 """Application entry point."""
 
-import logging
 import sys
 
 from PySide6.QtWidgets import QApplication
@@ -8,19 +7,32 @@ from PySide6.QtWidgets import QApplication
 from app.router.client import RouterClient
 from app.store.app_store import AppStore
 from app.ui.main_window import MainWindow
+from app.utils.logging_setup import (
+    install_crash_handler,
+    qt_message_handler,
+    setup_logging,
+)
 from config.settings import AppSettings
 from database.db import LocalDatabase
 
 
 def main() -> None:
     """Initialize and run the Router Manager application."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    # --- Logging & crash handling (must come first) ---
+    setup_logging()
+    install_crash_handler()
+
+    import logging
+
     logger = logging.getLogger(__name__)
 
     app = QApplication(sys.argv)
+
+    # Route Qt warnings/errors through Python logging
+    from PySide6 import QtCore
+
+    QtCore.qInstallMessageHandler(qt_message_handler)
+
     app.setApplicationName("Router Manager")
     app.setApplicationVersion("0.1.0")
 
