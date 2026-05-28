@@ -98,11 +98,32 @@ class RouterClient:
             logger.warning("Authentication required or expired for %s", self.host)
             raise RouterAuthError("Authentication required or expired")
 
+        if response.status_code != 200:
+            logger.error(
+                "HTTP %d from %s: %s",
+                response.status_code,
+                self.host,
+                response.text[:200],
+            )
+            raise RouterAPIError(
+                f"HTTP {response.status_code}: {response.text[:100]}",
+                code=response.status_code,
+            )
+
         try:
             data = response.json()
         except ValueError as e:
-            logger.error("Malformed JSON response from %s: %s", self.host, e)
-            raise RouterAPIError(f"Malformed JSON response: {e}") from e
+            response_preview = response.text[:200] if response.text else "(empty)"
+            logger.error(
+                "Malformed JSON from %s: %s. Response: %s",
+                self.host,
+                e,
+                response_preview,
+            )
+            raise RouterAPIError(
+                f"Respuesta no-JSON del router. ¿Es {self.host} un router compatible con ubus? "
+                f"Respuesta: {response_preview[:100]}",
+            ) from e
 
         if "error" in data:
             err = data["error"]
