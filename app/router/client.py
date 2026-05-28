@@ -206,6 +206,9 @@ class RouterClient:
         methods = [
             ("dhcp", "ipv4leases", {}),
             ("hostapd.wlan0", "get_clients", {}),
+            ("hostapd.wlan1", "get_clients", {}),
+            ("hostapd.phy0-ap0", "get_clients", {}),
+            ("hostapd.phy1-ap0", "get_clients", {}),
             ("network.interface", "dump", {}),
         ]
 
@@ -233,26 +236,38 @@ class RouterClient:
             data = result[1]
 
             if isinstance(data, dict):
-                if "dhcp" in data or "leases" in data:
-                    leases = (
-                        data.get("dhcp", {})
-                        .get("ipv4", {})
-                        .get("leases", [])
-                    )
-                    for lease in leases:
-                        devices.append({
-                            "mac": lease.get("mac", ""),
-                            "ip": lease.get("ip", ""),
-                            "hostname": lease.get("hostname", ""),
-                        })
+                # Try DHCP leases format first.
+                # Standard ubus dhcp.ipv4leases returns [0, {"leases": [...]}].
+                # Some routers nest it: [0, {"dhcp": {"leases": [...]}}]
+                # or [0, {"dhcp": {"ipv4": {"leases": [...]}}}].
+                leases = data.get("leases", [])
+                if not leases and "dhcp" in data:
+                    dhcp = data["dhcp"]
+                    if isinstance(dhcp, dict):
+                        leases = dhcp.get("leases", [])
+                        if not leases:
+                            leases = dhcp.get("ipv4", {}).get("leases", [])
 
-                elif "clients" in data:
+                if leases:
+                    for lease in leases:
+                        if isinstance(lease, dict):
+                            devices.append({
+                                "mac": lease.get("mac", ""),
+                                "ip": lease.get("ip", ""),
+                                "hostname": lease.get("hostname", ""),
+                            })
+                    return devices
+
+                # Try hostapd clients format.
+                if "clients" in data:
                     for mac, info in data["clients"].items():
-                        devices.append({
-                            "mac": mac,
-                            "ip": info.get("ip", ""),
-                            "hostname": info.get("hostname", ""),
-                        })
+                        if isinstance(info, dict):
+                            devices.append({
+                                "mac": mac,
+                                "ip": info.get("ip", ""),
+                                "hostname": info.get("hostname", ""),
+                            })
+                    return devices
 
         return devices
 
@@ -530,30 +545,52 @@ class RouterClient:
     def get_system_info(self) -> dict:
         """Get router system information.
 
+        Uses system.board (model, firmware version, hostname) plus
+        system.info (uptime). Returns keys compatible with
+        RouterInfo.from_router_data().
+
         Returns:
-            Dict with keys: model, firmware, uptime, memory, etc.
+            Dict with keys: model, firmware_version, hostname, uptime.
         """
         logger.debug("Fetching system info from %s", self.host)
 
+        info: dict = {}
+
+        # system.board provides model, firmware version, hostname
+        try:
+            params = [self.auth_token or "", "system", "board", {}]
+            result = self._rpc_call("call", params)
+
+            if isinstance(result, list) and len(result) >= 2:
+                board = result[1]
+                if isinstance(board, dict):
+                    info["model"] = board.get("model", "")
+                    info["hostname"] = board.get("hostname", "")
+                    release = board.get("release")
+                    if isinstance(release, dict):
+                        info["firmware_version"] = release.get("version", "")
+        except RouterError as e:
+            logger.debug("system.board query failed: %s", e)
+
+        # system.info provides uptime
         try:
             params = [self.auth_token or "", "system", "info", {}]
             result = self._rpc_call("call", params)
 
             if isinstance(result, list) and len(result) >= 2:
-                info = result[1]
-                if isinstance(info, dict):
-                    return {
-                        "model": info.get("model", "Unknown"),
-                        "firmware": info.get("firmware", "Unknown"),
-                        "uptime": info.get("uptime", 0),
-                        "memory_total": info.get("memory.total"),
-                        "memory_free": info.get("memory.free"),
-                        "hostname": info.get("hostname"),
-                    }
+                sysinfo = result[1]
+                if isinstance(sysinfo, dict):
+                    info["uptime"] = sysinfo.get("uptime", 0)
         except RouterError as e:
-            logger.warning("Failed to fetch system info: %s", e)
+            logger.debug("system.info query failed: %s", e)
 
-        return {}
+        # Ensure all expected keys have defaults
+        info.setdefault("model", "")
+        info.setdefault("firmware_version", "")
+        info.setdefault("hostname", "")
+        info.setdefault("uptime", 0)
+
+        return info
 
     def test_connection(self) -> bool:
         """Test router connectivity without full authentication.
