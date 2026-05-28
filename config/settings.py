@@ -13,8 +13,8 @@ class AppSettings:
     """Application settings with automatic JSON file persistence."""
 
     DEFAULT_CONFIG = {
-        "router_host": "192.168.1.1",
-        "router_username": "root",
+        "router_host": "192.168.0.1",
+        "router_username": "useradmin",
         "router_password": "",
         "polling_interval": 10,
         "theme": "dark",
