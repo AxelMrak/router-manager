@@ -2,7 +2,6 @@
 
 import logging
 import logging.handlers
-import os
 import sys
 import traceback
 from datetime import datetime
@@ -10,14 +9,9 @@ from pathlib import Path
 
 
 def get_log_dir() -> Path:
-    """Return platform-appropriate log directory."""
-    if sys.platform == "win32":
-        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Logs"
-    else:
-        base = Path.home() / ".local" / "share"
-    log_dir = base / "RouterManager" / "logs"
+    """Return log directory next to the executable/main script."""
+    exe_path = Path(sys.argv[0]).resolve()
+    log_dir = exe_path.parent / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
 
@@ -142,9 +136,11 @@ class CrashHandler:
                 msg_box.setText(
                     "La aplicación encontró un error inesperado y debe cerrarse."
                 )
+                from pathlib import Path
+                log_path = Path(sys.argv[0]).resolve().parent / "logs"
                 msg_box.setInformativeText(
                     f"{exc_type.__name__}: {exc_value}\n\n"
-                    f"Se guardó un registro en la carpeta de logs."
+                    f"Se guardó un registro en: {log_path}"
                 )
                 msg_box.setDetailedText(tb_text)
                 msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
