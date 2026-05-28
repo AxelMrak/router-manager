@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import threading
 from typing import Any
+from urllib.parse import urlencode
 
 import requests
 
@@ -57,6 +60,10 @@ class RouterClient:
     def _rpc_call(self, method: str, params: list) -> dict:
         """Make a JSON-RPC call to /ubus.
 
+        Uses application/x-www-form-urlencoded content-type to match
+        how the W7 router admin panel sends requests. Some consumer
+        routers (Netis, MiWiFi, etc.) reject application/json.
+
         Args:
             method: The ubus method name.
             params: Parameters for the RPC call.
@@ -70,17 +77,28 @@ class RouterClient:
             RouterAuthError: Authentication failed or expired.
             RouterAPIError: Malformed or unexpected response.
         """
-        payload = {
+        # Form-encode the JSON-RPC body — matching how the browser
+        # admin panel posts to /ubus with Content-Type:
+        #   application/x-www-form-urlencoded; charset=UTF-8
+        body = urlencode({
             "jsonrpc": "2.0",
             "id": self._next_id(),
             "method": method,
-            "params": params,
-        }
+            "params": json.dumps(params),
+        })
+
+        url = self.base_url
+        cookies = {}
+        if self.auth_token:
+            url = f"{self.base_url}?ubus_rpc_session={self.auth_token}"
+            cookies["ubus_rpc_session"] = self.auth_token
 
         try:
             response = self.session.post(
-                self.base_url,
-                json=payload,
+                url,
+                data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+                cookies=cookies,
                 timeout=self.timeout,
             )
         except requests.Timeout as e:
@@ -170,10 +188,46 @@ class RouterClient:
             self.auth_token = data.get("ubus_rpc_session")
             if self.auth_token:
                 logger.info("Login successful, token acquired for %s", self.host)
+                self._login_cgi()
                 return True
 
         logger.error("Login response missing token: %s", result)
         raise RouterAPIError("Login response missing auth token", response=result)
+
+    def _login_cgi(self) -> bool:
+        """Login via Netis CGI endpoint (POST /cgi-bin/login.cgi).
+
+        Netis/W7 routers use a proprietary CGI stack with cookie-based
+        authentication. The password is base64-encoded and the router
+        responds with a Set-Cookie: password=<base64> header. This cookie
+        authenticates all subsequent requests.
+
+        Returns:
+            True if CGI login succeeded and cookie was captured.
+        """
+        logger.info("Attempting CGI login to %s", self.host)
+
+        encoded_password = base64.b64encode(self.password.encode()).decode()
+        cgi_url = f"http://{self.host}/cgi-bin/login.cgi"
+
+        try:
+            response = self.session.post(
+                cgi_url,
+                data={"password": encoded_password},
+                timeout=self.timeout,
+            )
+        except requests.RequestException as e:
+            logger.debug("CGI login failed: %s", e)
+            return False
+
+        if response.status_code == 200:
+            cookie = response.headers.get("Set-Cookie", "")
+            if "password=" in cookie:
+                logger.info("CGI login successful for %s", self.host)
+                return True
+
+        logger.debug("CGI login: unexpected response %d", response.status_code)
+        return False
 
     def logout(self) -> None:
         """Log out from the router and clear the auth token."""
@@ -231,6 +285,10 @@ class RouterClient:
                 )
                 return devices
 
+        cgi_devices = self._get_devices_cgi()
+        if cgi_devices:
+            return cgi_devices
+
         if not available:
             logger.warning(
                 "No ubus services discovered on %s — router may not expose any data via ubus",
@@ -285,6 +343,53 @@ class RouterClient:
                             })
                     return devices
 
+        return devices
+
+    def _get_devices_cgi(self) -> list[dict]:
+        """Get devices via Netis CGI endpoints (skk_get.cgi).
+
+        W7/Netis routers use a proprietary CGI stack. This method tries
+        the POST /cgi-bin/skk_get.cgi endpoint to retrieve statsList
+        which contains connected device information.
+        """
+        logger.debug("Attempting CGI device fetch from %s", self.host)
+        cgi_url = f"http://{self.host}/cgi-bin/skk_get.cgi"
+
+        try:
+            response = self.session.post(
+                cgi_url,
+                data={"mode_name": "skk_get", "wl_link": "0"},
+                timeout=self.timeout,
+            )
+        except requests.RequestException as e:
+            logger.debug("CGI device fetch failed: %s", e)
+            return []
+
+        if response.status_code != 200:
+            return []
+
+        try:
+            data = response.json()
+        except ValueError:
+            logger.debug("CGI response is not JSON")
+            return []
+
+        devices = []
+        stats = data.get("statsList", data.get("statslist", []))
+
+        if isinstance(stats, dict):
+            stats = list(stats.values())
+
+        for entry in (stats if isinstance(stats, list) else []):
+            if isinstance(entry, dict):
+                devices.append({
+                    "mac": entry.get("mac", entry.get("hwaddr", "")),
+                    "ip": entry.get("ip", entry.get("ipaddr", "")),
+                    "hostname": entry.get("hostname", entry.get("name", "")),
+                })
+
+        if devices:
+            logger.info("Found %d devices via CGI on %s", len(devices), self.host)
         return devices
 
     def get_host_list(self) -> list[dict]:
@@ -561,9 +666,9 @@ class RouterClient:
     def get_system_info(self) -> dict:
         """Get router system information.
 
-        Uses system.board (model, firmware version, hostname) plus
-        system.info (uptime). Returns keys compatible with
-        RouterInfo.from_router_data().
+        Tries standard OpenWrt system.board + system.info first,
+        then falls back to W7/Netis proprietary system.info format
+        which wraps data in a .values sub-object.
 
         Returns:
             Dict with keys: model, firmware_version, hostname, uptime.
@@ -572,7 +677,7 @@ class RouterClient:
 
         info: dict = {}
 
-        # system.board provides model, firmware version, hostname
+        # Standard OpenWrt: system.board provides model, firmware, hostname
         try:
             params = [self.auth_token or "", "system", "board", {}]
             result = self._rpc_call("call", params)
@@ -588,7 +693,7 @@ class RouterClient:
         except RouterError as e:
             logger.debug("system.board query failed: %s", e)
 
-        # system.info provides uptime
+        # Standard OpenWrt: system.info provides uptime
         try:
             params = [self.auth_token or "", "system", "info", {}]
             result = self._rpc_call("call", params)
@@ -596,11 +701,18 @@ class RouterClient:
             if isinstance(result, list) and len(result) >= 2:
                 sysinfo = result[1]
                 if isinstance(sysinfo, dict):
-                    info["uptime"] = sysinfo.get("uptime", 0)
+                    # W7/Netis routers wrap data in .values (proprietary format)
+                    values = sysinfo.get("values", sysinfo)
+                    if isinstance(values, dict):
+                        info["uptime"] = values.get("uptime", 0)
+                        # W7 system.info also contains model/hostname
+                        if not info.get("model") and values.get("model"):
+                            info["model"] = values["model"]
+                        if not info.get("hostname") and values.get("hostname"):
+                            info["hostname"] = values["hostname"]
         except RouterError as e:
             logger.debug("system.info query failed: %s", e)
 
-        # Ensure all expected keys have defaults
         info.setdefault("model", "")
         info.setdefault("firmware_version", "")
         info.setdefault("hostname", "")
@@ -617,10 +729,17 @@ class RouterClient:
         logger.debug("Testing connection to %s", self.host)
 
         try:
+            body = urlencode({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "list",
+                "params": "[]",
+            })
             response = self.session.post(
                 self.base_url,
+                data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
                 timeout=5,
-                json={"jsonrpc": "2.0", "id": 1, "method": "list", "params": []},
             )
             return response.status_code in (200, 401, 403)
         except requests.RequestException as e:
