@@ -1,29 +1,38 @@
 name: Build Windows Installer
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v1.0.2)"
+        required: true
+        type: string
+      changelog:
+        description: "Release notes"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   build:
     runs-on: windows-latest
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Python 3.12
       uses: actions/setup-python@v5
       with:
-        python-version: '3.12'
-    
+        python-version: "3.12"
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pyinstaller
-    
+
     - name: Build executable with PyInstaller
+      shell: pwsh
       run: |
         $args = @(
           "--name=RouterManager"
@@ -39,17 +48,39 @@ jobs:
           $args = @("--icon=assets/icon.ico") + $args
         }
         pyinstaller @args
-    
+
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: RouterManager-Windows
         path: dist/RouterManager.exe
-    
-    - name: Upload to release
-      if: github.event_name == 'release'
+
+    - name: Create tag and release
+      id: create_release
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        gh release upload "${{ github.event.release.tag_name }}" dist/RouterManager.exe --clobber
+        TAG="${{ inputs.version }}"
+        git config user.name "github-actions"
+        git config user.email "actions@github.com"
+        git tag -f "$TAG"
+        git push origin "$TAG" --force
+
+        if gh release view "$TAG" --json tagName &>/dev/null; then
+          echo "Release $TAG already exists, will upload separately"
+        else
+          NOTES="${{ inputs.changelog }}"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes "${NOTES:-Build $TAG}" \
+            --target "${{ github.sha }}"
+        fi
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+    - name: Upload executable to release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release upload "${{ steps.create_release.outputs.tag }}" dist/RouterManager.exe --clobber
