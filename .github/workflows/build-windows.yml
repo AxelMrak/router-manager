@@ -25,16 +25,20 @@ jobs:
     
     - name: Build executable with PyInstaller
       run: |
-        $iconArg = if (Test-Path "assets/icon.ico") { "--icon=assets/icon.ico" } else { "" }
-        pyinstaller --name="Router Manager" `
-          --windowed `
-          --onefile `
-          $iconArg `
-          --add-data="assets;assets" `
-          --hidden-import=PySide6.QtCore `
-          --hidden-import=PySide6.QtGui `
-          --hidden-import=PySide6.QtWidgets `
-          main.py
+        $args = @(
+          "--name=Router Manager"
+          "--windowed"
+          "--onefile"
+          "--add-data=assets;assets"
+          "--hidden-import=PySide6.QtCore"
+          "--hidden-import=PySide6.QtGui"
+          "--hidden-import=PySide6.QtWidgets"
+          "main.py"
+        )
+        if (Test-Path "assets/icon.ico") {
+          $args = @("--icon=assets/icon.ico") + $args
+        }
+        pyinstaller @args
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
