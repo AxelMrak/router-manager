@@ -55,32 +55,20 @@ jobs:
         name: RouterManager-Windows
         path: dist/RouterManager.exe
 
-    - name: Create tag and release
-      id: create_release
-      shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        TAG="${{ inputs.version }}"
-        git config user.name "github-actions"
-        git config user.email "actions@github.com"
-        git tag -f "$TAG"
-        git push origin "$TAG" --force
-
-        if gh release view "$TAG" --json tagName &>/dev/null; then
-          echo "Release $TAG already exists, will upload separately"
-        else
-          NOTES="${{ inputs.changelog }}"
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --notes "${NOTES:-Build $TAG}" \
-            --target "${{ github.sha }}"
-        fi
-        echo "tag=$TAG" >> $GITHUB_OUTPUT
-
     - name: Upload executable to release
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        gh release upload "${{ steps.create_release.outputs.tag }}" dist/RouterManager.exe --clobber
+        TAG="${{ inputs.version }}"
+        NOTES="${{ inputs.changelog }}"
+
+        # Delete existing release/tag if present (from a previous failed run)
+        gh release delete "$TAG" --yes 2>/dev/null || true
+
+        # Create release (also creates the tag) and upload in one command
+        gh release create "$TAG" \
+          --title "$TAG" \
+          --notes "${NOTES:-Build $TAG}" \
+          --target "${{ github.sha }}" \
+          dist/RouterManager.exe
