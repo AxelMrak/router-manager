@@ -3,6 +3,8 @@ name: Build Windows Installer
 on:
   release:
     types: [published]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -26,7 +28,7 @@ jobs:
     - name: Build executable with PyInstaller
       run: |
         $args = @(
-          "--name=Router Manager"
+          "--name=RouterManager"
           "--windowed"
           "--onefile"
           "--add-data=assets;assets"
@@ -44,7 +46,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: RouterManager-Windows
-        path: dist/Router Manager.exe
+        path: dist/RouterManager.exe
     
     - name: Upload to release
       if: github.event_name == 'release'
