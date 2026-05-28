@@ -176,6 +176,7 @@ class RouterClient:
             self.auth_token = data.get("ubus_rpc_session")
             if self.auth_token:
                 logger.info("Login successful, token acquired for %s", self.host)
+                self._cgi_password = base64.b64encode(self.password.encode()).decode()
                 self._login_cgi()
                 return True
 
@@ -235,8 +236,9 @@ class RouterClient:
     def get_devices(self) -> list[dict]:
         """Get all connected devices from the router.
 
-        Discovers available ubus services and tries each known
-        device source, with auth token retry on permission denied.
+        Tries standard OpenWrt ubus first. If no ubus services are
+        available (common on W7/Netis consumer routers), falls back
+        to proprietary CGI endpoints.
 
         Returns:
             List of device dicts with keys: mac, ip, hostname, etc.
@@ -244,6 +246,12 @@ class RouterClient:
         logger.debug("Fetching connected devices from %s", self.host)
 
         available = self.get_available_services()
+
+        if not available:
+            logger.debug("No ubus services on %s — trying CGI first", self.host)
+            cgi_devices = self._get_devices_cgi()
+            if cgi_devices:
+                return cgi_devices
 
         device_methods: list[tuple[str, str, dict]] = []
 
@@ -333,52 +341,116 @@ class RouterClient:
 
         return devices
 
-    def _get_devices_cgi(self) -> list[dict]:
-        """Get devices via Netis CGI endpoints (skk_get.cgi).
+    def _fetch_cgi(self, endpoint: str, body: dict) -> dict | None:
+        """POST to a CGI endpoint with cookie auth.
 
-        W7/Netis routers use a proprietary CGI stack. This method tries
-        the POST /cgi-bin/skk_get.cgi endpoint to retrieve statsList
-        which contains connected device information.
+        W7/Netis routers authenticate CGI requests via Cookie: password=<base64>.
+        This is entirely separate from the ubus_rpc_session token.
         """
-        logger.debug("Attempting CGI device fetch from %s", self.host)
-        cgi_url = f"http://{self.host}/cgi-bin/skk_get.cgi"
+        url = f"http://{self.host}{endpoint}"
+        cookies = {}
+        if hasattr(self, "_cgi_password"):
+            cookies["password"] = self._cgi_password
 
         try:
             response = self.session.post(
-                cgi_url,
-                data={"mode_name": "skk_get", "wl_link": "0"},
-                timeout=self.timeout,
+                url, data=body, cookies=cookies, timeout=self.timeout
             )
         except requests.RequestException as e:
-            logger.debug("CGI device fetch failed: %s", e)
-            return []
+            logger.debug("CGI %s failed: %s", endpoint, e)
+            return None
 
         if response.status_code != 200:
-            return []
+            logger.debug("CGI %s returned HTTP %d", endpoint, response.status_code)
+            return None
 
         try:
-            data = response.json()
+            return response.json()
         except ValueError:
-            logger.debug("CGI response is not JSON")
-            return []
+            logger.debug("CGI %s response is not JSON", endpoint)
+            return None
 
-        devices = []
-        stats = data.get("statsList", data.get("statslist", []))
+    def _get_devices_cgi(self) -> list[dict]:
+        """Get devices via Netis CGI endpoint (skk_get.cgi).
 
-        if isinstance(stats, dict):
-            stats = list(stats.values())
+        W7/Netis routers use a proprietary CGI stack. POST /cgi-bin/skk_get.cgi
+        returns system info + device lists (arpList, dhcpList, statsList).
+        Falls back to /cgi-bin-igd/netcore_get.cgi for older firmware.
 
-        for entry in (stats if isinstance(stats, list) else []):
-            if isinstance(entry, dict):
-                devices.append({
-                    "mac": entry.get("mac", entry.get("hwaddr", "")),
-                    "ip": entry.get("ip", entry.get("ipaddr", "")),
-                    "hostname": entry.get("hostname", entry.get("name", "")),
-                })
+        Auth: Cookie: password=<base64>
+        """
+        devices: list[dict] = []
+
+        data = self._fetch_cgi(
+            "/cgi-bin/skk_get.cgi",
+            {"mode_name": "skk_get", "wl_link": "0"},
+        )
+
+        if data:
+            for source in ("arpList", "dhcpList", "statsList"):
+                entries = data.get(source, data.get(source.lower(), []))
+                if isinstance(entries, dict):
+                    entries = list(entries.values())
+                for entry in (entries if isinstance(entries, list) else []):
+                    if isinstance(entry, dict):
+                        devices.append({
+                            "mac": entry.get("mac", entry.get("hwaddr", entry.get("hwAddr", ""))),
+                            "ip": entry.get("ip", entry.get("ipaddr", entry.get("ipAddr", ""))),
+                            "hostname": entry.get(
+                                "hostname",
+                                entry.get("name", entry.get("hostName", ""))
+                            ),
+                        })
+
+        if not devices:
+            data = self._fetch_cgi(
+                "/cgi-bin-igd/netcore_get.cgi",
+                {"mode_name": "netcore_get", "no": "no"},
+            )
+            if data:
+                # Legacy response format varies — extract anything that looks like a device
+                for key in ("dev_list", "dhcp_list", "arp_list", "client_list"):
+                    entries = data.get(key, [])
+                    if isinstance(entries, dict):
+                        entries = list(entries.values())
+                    for entry in (entries if isinstance(entries, list) else []):
+                        if isinstance(entry, dict):
+                            devices.append({
+                                "mac": entry.get("mac", entry.get("hwaddr", "")),
+                                "ip": entry.get("ip", ""),
+                                "hostname": entry.get("hostname", entry.get("name", "")),
+                            })
 
         if devices:
             logger.info("Found %d devices via CGI on %s", len(devices), self.host)
+        else:
+            logger.debug("No devices found via CGI on %s", self.host)
+
         return devices
+
+    def _get_system_info_cgi(self) -> dict:
+        """Get router system info via skk_get.cgi.
+
+        W7/Netis routers return system info in the skk_get.cgi response,
+        including version, model, uptime, CPU, memory, etc.
+        """
+        data = self._fetch_cgi(
+            "/cgi-bin/skk_get.cgi",
+            {"mode_name": "skk_get", "wl_link": "0"},
+        )
+        if not data:
+            return {}
+
+        info: dict = {}
+        if "model" in data:
+            info["model"] = data["model"]
+        if "hostname" in data:
+            info["hostname"] = data["hostname"]
+        if "version" in data:
+            info["firmware_version"] = data["version"]
+        if "uptime" in data:
+            info["uptime"] = data["uptime"]
+        return info
 
     def get_host_list(self) -> list[dict]:
         """Get host list via alternative network APIs.
@@ -705,6 +777,14 @@ class RouterClient:
         info.setdefault("firmware_version", "")
         info.setdefault("hostname", "")
         info.setdefault("uptime", 0)
+
+        if not info["model"] and not info["uptime"]:
+            cgi_info = self._get_system_info_cgi()
+            if cgi_info:
+                logger.info("Got system info via CGI from %s", self.host)
+                for key in ("model", "firmware_version", "hostname", "uptime"):
+                    if key in cgi_info and cgi_info[key]:
+                        info[key] = cgi_info[key]
 
         return info
 
