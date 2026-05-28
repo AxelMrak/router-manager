@@ -193,7 +193,7 @@ class RouterClient:
         Returns:
             True if CGI login succeeded and cookie was captured.
         """
-        logger.info("Attempting CGI login to %s", self.host)
+        logger.debug("Attempting CGI login to %s", self.host)
 
         encoded_password = base64.b64encode(self.password.encode()).decode()
         cgi_url = f"http://{self.host}/cgi-bin/login.cgi"
