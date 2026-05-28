@@ -208,6 +208,8 @@ class SettingsPage(QWidget):
         thread.result.connect(on_result)
         thread.error.connect(on_error)
         thread.start()
+        # Keep reference to prevent GC while thread is running
+        self._test_thread = thread
 
     def _on_save_connect(self):
         from app.utils.threading import WorkerThread
@@ -253,3 +255,5 @@ class SettingsPage(QWidget):
         thread.result.connect(on_result)
         thread.error.connect(on_error)
         thread.start()
+        # Keep reference to prevent GC while thread is running
+        self._save_thread = thread

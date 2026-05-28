@@ -538,19 +538,17 @@ class RouterClient:
         """Test router connectivity without full authentication.
 
         Returns:
-            True if router is reachable.
+            True if router is reachable and responds to ubus API.
         """
         logger.debug("Testing connection to %s", self.host)
 
         try:
-            response = self.session.get(
+            response = self.session.post(
                 self.base_url,
                 timeout=5,
                 json={"jsonrpc": "2.0", "id": 1, "method": "list", "params": []},
             )
-            if response.status_code == 200:
-                return True
-        except requests.RequestException:
-            pass
-
-        return False
+            return response.status_code in (200, 401, 403)
+        except requests.RequestException as e:
+            logger.debug("Connection test failed: %s", e)
+            return False
