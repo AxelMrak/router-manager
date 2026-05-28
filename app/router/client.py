@@ -193,39 +193,55 @@ class RouterClient:
     def get_devices(self) -> list[dict]:
         """Get all connected devices from the router.
 
-        Tries multiple ubus call patterns to retrieve device information:
-        - dhcp ipv4leases
-        - hostapd get_clients
-        - network.interface dump
+        Discovers available ubus services and tries each known
+        device source, with auth token retry on permission denied.
 
         Returns:
             List of device dicts with keys: mac, ip, hostname, etc.
         """
         logger.debug("Fetching connected devices from %s", self.host)
 
-        methods = [
-            ("dhcp", "ipv4leases", {}),
-            ("hostapd.wlan0", "get_clients", {}),
-            ("hostapd.wlan1", "get_clients", {}),
-            ("hostapd.phy0-ap0", "get_clients", {}),
-            ("hostapd.phy1-ap0", "get_clients", {}),
-            ("network.interface", "dump", {}),
-        ]
+        available = self.get_available_services()
 
-        for service, method, params in methods:
-            try:
-                rpc_params = [self.auth_token or "", service, method, params]
-                result = self._rpc_call("call", rpc_params)
+        device_methods: list[tuple[str, str, dict]] = []
 
-                devices = self._normalize_device_list(result)
-                if devices:
-                    logger.debug("Found %d devices via %s.%s", len(devices), service, method)
-                    return devices
-            except RouterError as e:
-                logger.debug("Device query via %s.%s failed: %s", service, method, e)
+        if "dhcp" in available or not available:
+            device_methods.append(("dhcp", "ipv4leases", {}))
+
+        for svc in sorted(available):
+            if svc.startswith("hostapd."):
+                device_methods.append((svc, "get_clients", {}))
+
+        if not any("hostapd" in s for s in available):
+            for iface in ("wlan0", "wlan1", "phy0-ap0", "phy1-ap0", "radio0", "radio1"):
+                device_methods.append((f"hostapd.{iface}", "get_clients", {}))
+
+        if "network.interface" in available or not available:
+            device_methods.append(("network.interface", "dump", {}))
+
+        for service, method, params in device_methods:
+            result = self._try_rpc_with_retry(service, method, params)
+            if result is None:
                 continue
 
-        logger.warning("No devices found via any known method on %s", self.host)
+            devices = self._normalize_device_list(result)
+            if devices:
+                logger.info(
+                    "Found %d devices via %s.%s on %s", len(devices), service, method, self.host
+                )
+                return devices
+
+        if not available:
+            logger.warning(
+                "No ubus services discovered on %s — router may not expose any data via ubus",
+                self.host,
+            )
+        else:
+            logger.warning(
+                "No devices found via any method on %s. Available services: %s",
+                self.host,
+                sorted(available),
+            )
         return []
 
     def _normalize_device_list(self, result: Any) -> list[dict]:
@@ -610,3 +626,68 @@ class RouterClient:
         except requests.RequestException as e:
             logger.debug("Connection test failed: %s", e)
             return False
+
+    def get_available_services(self) -> set[str]:
+        """Discover ubus services accessible to the current session.
+
+        Calls 'ubus list' with and without auth token to find what
+        services and methods are available on this router.
+
+        Returns:
+            Set of service names (e.g. {'dhcp', 'system', 'network.interface'}).
+        """
+        logger.debug("Discovering available ubus services on %s", self.host)
+
+        services: set[str] = set()
+
+        for token in (self.auth_token, None):
+            params = [token or "", "list", ""] if token else ["list", ""]
+            try:
+                result = self._rpc_call("list", params) if token else self._rpc_call(
+                    "list", params
+                )
+                if isinstance(result, list) and len(result) >= 2:
+                    data = result[1] if isinstance(result[1], dict) else {}
+                    services.update(data.keys())
+            except RouterError as e:
+                logger.debug("ubus list query failed (token=%s): %s", bool(token), e)
+
+        logger.info("Found %d accessible ubus services on %s", len(services), self.host)
+        if services:
+            logger.debug("Available services: %s", sorted(services))
+        return services
+
+    def _try_rpc_with_retry(self, service: str, method: str, params: dict) -> list | None:
+        """Try an ubus call with auth token, retry without if denied.
+
+        Returns None on failure, the result list on success.
+        """
+        if self.auth_token:
+            try:
+                result = self._rpc_call(
+                    "call", [self.auth_token, service, method, params]
+                )
+                if isinstance(result, list) and len(result) >= 1:
+                    return result
+            except RouterAuthError:
+                logger.debug(
+                    "Permission denied for %s.%s with auth, retrying without",
+                    service,
+                    method,
+                )
+            except RouterError as e:
+                logger.debug(
+                    "Service %s.%s not found: %s", service, method, e
+                )
+                return None
+
+        try:
+            result = self._rpc_call(
+                "call", ["00000000000000000000000000000000", service, method, params]
+            )
+            if isinstance(result, list) and len(result) >= 1:
+                return result
+        except RouterError as e:
+            logger.debug("Service %s.%s unavailable (no auth): %s", service, method, e)
+
+        return None
